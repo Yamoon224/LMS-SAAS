@@ -1,0 +1,125 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Canaux RGB : surchargés par la marque du tenant quand elle est exposée. */
+  --primary: 15 118 110;
+  --primary-foreground: 255 255 255;
+  --ink: 15 23 42;
+  --subtle: 82 96 119;
+  --line: 219 226 236;
+  --canvas: 241 245 249;
+  --card: 255 255 255;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+/* Alphabets non latins : police Noto (chargée par next/font pour cette seule langue) puis polices système. */
+html[lang="ar"] body {
+  font-family: var(--font-arabic), "Noto Sans Arabic", "Segoe UI", Tahoma, "Geeza Pro", system-ui, sans-serif;
+  line-height: 1.65;
+}
+html[lang="zh"] body {
+  font-family: var(--font-sans), var(--font-chinese), "Noto Sans SC", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
+}
+html[lang="ru"] body,
+html[lang="tr"] body {
+  /* Tranches Inter cyrillique / latin étendu (layout.tsx) en complément du latin ; repli système sinon. */
+  font-family: var(--font-sans), var(--font-sans-ext), system-ui, "Segoe UI", sans-serif;
+}
+/* L'espacement des lettres casse la liaison des lettres arabes. */
+html[lang="ar"] *,
+html[lang="ar"] *::before,
+html[lang="ar"] *::after {
+  letter-spacing: normal !important;
+}
+
+/* Style « Techlium » : ombres de cartes marquées, accent en dégradé, titres soulignés, scrollbars de marque. */
+:root {
+  --card-shadow: 0 1px 2px rgb(16 24 40 / 0.08), 0 8px 20px -6px rgb(16 24 40 / 0.18);
+  --card-shadow-hover: 0 2px 4px rgb(16 24 40 / 0.1), 0 14px 28px -8px rgb(16 24 40 / 0.28);
+  --accent-gradient: linear-gradient(135deg, rgb(var(--primary)) 0%, color-mix(in oklab, rgb(var(--primary)) 85%, white) 100%);
+  --accent-gradient-hover: linear-gradient(135deg, color-mix(in oklab, rgb(var(--primary)) 90%, black) 0%, rgb(var(--primary)) 100%);
+}
+.bg-primary-gradient { background-image: var(--accent-gradient); }
+.hover\:bg-primary-gradient-hover:hover { background-image: var(--accent-gradient-hover); }
+.page-title {
+  display: inline-block;
+  padding-bottom: 0.3rem;
+  border-bottom: 4px solid rgb(var(--primary));
+}
+* { scrollbar-width: thin; scrollbar-color: rgb(var(--primary)) transparent; }
+
+body {
+  background-color: rgb(var(--canvas));
+  color: rgb(var(--ink));
+  overflow-x: hidden;
+}
+
+:focus-visible {
+  outline: 2px solid rgb(var(--primary));
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Typographie des contenus de leçon (HTML assaini) : sans plugin typography. */
+.prose-lesson {
+  font-size: 1rem;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.prose-lesson > * + * {
+  margin-top: 1rem;
+}
+.prose-lesson h1,
+.prose-lesson h2,
+.prose-lesson h3,
+.prose-lesson h4 {
+  font-weight: 700;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+  margin-top: 1.5rem;
+}
+.prose-lesson h1 { font-size: 1.5rem; }
+.prose-lesson h2 { font-size: 1.25rem; }
+.prose-lesson h3 { font-size: 1.125rem; }
+.prose-lesson ul { list-style: disc; padding-left: 1.5rem; }
+.prose-lesson ol { list-style: decimal; padding-left: 1.5rem; }
+.prose-lesson li + li { margin-top: 0.25rem; }
+.prose-lesson a { color: rgb(var(--primary)); text-decoration: underline; text-underline-offset: 3px; }
+.prose-lesson blockquote {
+  border-left: 4px solid rgb(var(--primary) / 0.4);
+  background: rgb(var(--canvas));
+  padding: 0.75rem 1rem;
+  border-radius: 0 0.5rem 0.5rem 0;
+  color: rgb(var(--subtle));
+}
+.prose-lesson img { max-width: 100%; height: auto; border-radius: 0.75rem; }
+.prose-lesson pre,
+.prose-lesson code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.875em;
+  background: rgb(var(--ink) / 0.06);
+  border-radius: 0.375rem;
+}
+.prose-lesson code { padding: 0.1rem 0.35rem; }
+.prose-lesson pre { padding: 0.75rem 1rem; overflow-x: auto; }
+.prose-lesson table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; font-size: 0.9375rem; }
+.prose-lesson th,
+.prose-lesson td { border: 1px solid rgb(var(--line)); padding: 0.5rem 0.75rem; text-align: left; }
+.prose-lesson th { background: rgb(var(--canvas)); font-weight: 600; }
+.prose-lesson hr { border: 0; border-top: 1px solid rgb(var(--line)); }
+.prose-lesson > :first-child { margin-top: 0; }

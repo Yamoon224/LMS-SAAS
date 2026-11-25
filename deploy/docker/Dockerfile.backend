@@ -1,0 +1,56 @@
+# syntax=docker/dockerfile:1.7
+# Backend NestJS — image multi-étapes, utilisateur non-root.
+# Contexte de build : racine du dépôt.  docker build -f deploy/docker/Dockerfile.backend -t saas-lms-backend .
+# Cibles : "runtime" (défaut, dépendances de production) et "migrate" (CLI Prisma, pour `prisma migrate deploy`).
+
+ARG NODE_VERSION=20
+ARG PNPM_VERSION=9.15.0
+
+FROM node:${NODE_VERSION}-alpine AS base
+ARG PNPM_VERSION
+ENV HUSKY=0 CI=true
+RUN apk add --no-cache openssl libc6-compat \
+ && corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
+WORKDIR /repo
+
+FROM base AS build
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY backend/package.json backend/
+COPY admin/package.json admin/
+COPY business/package.json business/
+COPY learning/package.json learning/
+RUN --mount=type=cache,id=pnpm-store,target=/root/.local/share/pnpm/store \
+    pnpm install --frozen-lockfile --filter backend...
+COPY backend backend
+RUN pnpm --filter backend db:generate && pnpm --filter backend build
+# Dépendances autonomes du backend (pnpm deploy), puis client Prisma généré dans ce répertoire.
+RUN pnpm --filter backend deploy /out \
+ && cp -r backend/dist /out/dist \
+ && cp -r backend/prisma /out/prisma \
+ && cd /out && pnpm exec prisma generate
+
+# Étape one-shot de migration : conserve la CLI Prisma (devDependency).
+FROM node:${NODE_VERSION}-alpine AS migrate
+RUN apk add --no-cache openssl libc6-compat
+ENV NODE_ENV=production
+WORKDIR /app
+COPY --from=build --chown=node:node /out /app
+USER node
+CMD ["node", "node_modules/prisma/build/index.js", "migrate", "deploy"]
+
+# Élagage des dépendances de développement (le client Prisma généré est conservé).
+FROM build AS prune
+WORKDIR /out
+RUN pnpm prune --prod
+
+FROM node:${NODE_VERSION}-alpine AS runtime
+RUN apk add --no-cache openssl libc6-compat tini
+ENV NODE_ENV=production PORT=3001
+WORKDIR /app
+COPY --from=prune --chown=node:node /out /app
+USER node
+EXPOSE 3001
+HEALTHCHECK --interval=15s --timeout=5s --start-period=40s --retries=5 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3001)+'/'+(process.env.API_PREFIX||'v1')+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["node", "dist/main.js"]

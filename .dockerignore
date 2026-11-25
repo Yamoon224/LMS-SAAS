@@ -1,0 +1,21 @@
+# Contexte de build Docker (racine du monorepo) : on n'envoie ni dépendances, ni sorties de build, ni secrets.
+**/node_modules
+**/.next
+**/.next-build
+**/dist
+**/coverage
+**/.turbo
+**/*.tsbuildinfo
+.git
+.github
+.husky
+.claude
+docs
+deploy/backup
+**/.env
+**/.env.*
+!**/.env.example
+**/*.log
+**/.DS_Store
+backend/test
+**/playwright-report

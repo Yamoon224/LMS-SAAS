@@ -1,0 +1,1387 @@
+// Schéma Prisma — Plateforme SaaS LMS
+// Reflète le modèle de données du cahier des charges (section 10).
+// Stratégie multi-tenant: base partagée, isolation logique par tenant_id (section 3.2).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// Identité & accès (auth, users, rbac)
+// ============================================================
+
+enum UserType {
+  PLATFORM_ADMIN
+  COMPANY_USER
+  LEARNER
+}
+
+enum UserStatus {
+  ACTIVE
+  INVITED
+  SUSPENDED
+  DEACTIVATED
+}
+
+enum PermissionScope {
+  PLATFORM
+  TENANT
+}
+
+model User {
+  id             String     @id @default(uuid())
+  tenantId       String?    @map("tenant_id") // null pour les comptes plateforme (Admin)
+  tenant         Tenant?    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  type           UserType
+  email          String
+  passwordHash   String?    @map("password_hash")
+  firstName      String     @map("first_name")
+  lastName       String     @map("last_name")
+  phone          String?
+  locale         String     @default("fr")
+  status         UserStatus @default(INVITED)
+  twoFactorSecret String?   @map("two_factor_secret")
+  twoFactorEnabled Boolean  @default(false) @map("two_factor_enabled")
+  twoFactorEnabledAt DateTime? @map("two_factor_enabled_at")
+  twoFactorLastStep Int?    @map("two_factor_last_step") // dernier pas TOTP accepté (anti-rejeu)
+  twoFactorFailedAttempts Int @default(0) @map("two_factor_failed_attempts")
+  twoFactorLockedUntil DateTime? @map("two_factor_locked_until")
+  emailVerifiedAt DateTime? @map("email_verified_at")
+  lastLoginAt    DateTime?  @map("last_login_at")
+  /// Étape 28 (RGPD) : date d'anonymisation irréversible du compte (nom, e-mail, téléphone remplacés).
+  anonymizedAt   DateTime?  @map("anonymized_at")
+  createdAt      DateTime   @default(now()) @map("created_at")
+  updatedAt      DateTime   @updatedAt @map("updated_at")
+
+  roles          UserRole[]
+  enrollments    Enrollment[]
+  refreshTokens  RefreshToken[]
+  invitationTokens InvitationToken[]
+  twoFactorRecoveryCodes TwoFactorRecoveryCode[]
+  twoFactorChallenges TwoFactorChallenge[]
+  auditLogs      AuditLog[]
+
+  // Un même e-mail peut exister sur plusieurs tenants comme comptes distincts (RG-20).
+  @@unique([tenantId, email])
+  @@index([email])
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @map("token_hash")
+  expiresAt DateTime @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+/** Code de récupération 2FA à usage unique : seul son hash argon2 est stocké (affiché une seule fois à la création). */
+model TwoFactorRecoveryCode {
+  id        String    @id @default(uuid())
+  userId    String    @map("user_id")
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  codeHash  String    @map("code_hash")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("two_factor_recovery_codes")
+}
+
+/**
+ * Jeton de défi 2FA (5 min, usage unique) émis après un mot de passe valide : VERIFY = fournir un code,
+ * ENROLL = activer la 2FA obligatoire. Opaque (aléatoire, jamais un JWT) : seul son hash SHA-256 est stocké.
+ */
+model TwoFactorChallenge {
+  id         String    @id @default(uuid())
+  userId     String    @map("user_id")
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  purpose    String    // VERIFY | ENROLL
+  tokenHash  String    @unique @map("token_hash")
+  expiresAt  DateTime  @map("expires_at")
+  consumedAt DateTime? @map("consumed_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("two_factor_challenges")
+}
+
+/**
+ * Lien d'activation (ADM-05) ou de réinitialisation de mot de passe (ADM-06).
+ * Seul le hash du token brut est stocké.
+ */
+model InvitationToken {
+  id         String    @id @default(uuid())
+  userId     String    @map("user_id")
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String    @unique @map("token_hash")
+  expiresAt  DateTime  @map("expires_at")
+  consumedAt DateTime? @map("consumed_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("invitation_tokens")
+}
+
+model Role {
+  id          String           @id @default(uuid())
+  tenantId    String?          @map("tenant_id") // null = rôle plateforme par défaut
+  tenant      Tenant?          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  scope       PermissionScope
+  name        String
+  isDefault   Boolean          @default(false) @map("is_default")
+  permissions RolePermission[]
+  userRoles   UserRole[]
+  createdAt   DateTime         @default(now()) @map("created_at")
+
+  @@unique([tenantId, name])
+  @@map("roles")
+}
+
+model Permission {
+  id          String           @id @default(uuid())
+  code        String           @unique // ex: "courses.publish", "payouts.approve"
+  scope       PermissionScope
+  description String?
+  roles       RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String     @map("role_id")
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permissionId String     @map("permission_id")
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  userId String   @map("user_id")
+  user   User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  roleId String   @map("role_id")
+  role   Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@map("user_roles")
+}
+
+// ============================================================
+// Tenancy (tenants, branding)
+// ============================================================
+
+enum TenantStatus {
+  DRAFT
+  ACTIVE
+  SUSPENDED
+  ARCHIVED
+}
+
+model Tenant {
+  id                     String       @id @default(uuid())
+  name                   String
+  slug                   String       @unique
+  status                 TenantStatus @default(DRAFT)
+  statusReason           String?      @map("status_reason")
+  country                String       @default("CI")
+  currency               String       @default("XOF")
+  defaultLocale          String       @default("fr") @map("default_locale")
+  branding               Json?        // logo, favicon, couleurs, bannière
+  legalInfo              Json?        @map("legal_info")
+  contactEmail           String?      @map("contact_email")
+  contactPhone           String?      @map("contact_phone")
+  payoutAccount          Json?        @map("payout_account") // RIB / mobile money, vérifié
+  payoutAccountVerified  Boolean      @default(false) @map("payout_account_verified")
+  offlinePaymentEnabled  Boolean      @default(false) @map("offline_payment_enabled")
+  offlinePaymentInstructions String?  @map("offline_payment_instructions")
+  customDomain           String?      @unique @map("custom_domain") // V2
+  createdAt              DateTime     @default(now()) @map("created_at")
+  updatedAt              DateTime     @updatedAt @map("updated_at")
+  archivedAt             DateTime?    @map("archived_at")
+
+  users            User[]
+  roles            Role[]
+  subscriptions    Subscription[]
+  payments         Payment[]
+  creditWallet     CreditWallet?
+  courses          Course[]
+  liveSessions     LiveSession[]
+  ledgerEntries    LedgerEntry[]
+  payouts          Payout[]
+  refunds          Refund[]
+  commissionRules  CommissionRule[]
+  translationJobs  TranslationJob[]
+  auditLogs        AuditLog[]
+  certificateTemplates CertificateTemplate[]
+  mediaAssets      MediaAsset[]
+
+  @@map("tenants")
+}
+
+// ============================================================
+// Facturation SaaS (plans, subscriptions, ai-credits)
+// ============================================================
+
+enum BillingPeriod {
+  MONTHLY
+  QUARTERLY
+  YEARLY
+}
+
+model Plan {
+  id          String      @id @default(uuid())
+  name        String
+  description String?
+  isPublic    Boolean     @default(true) @map("is_public")
+  isArchived  Boolean     @default(false) @map("is_archived")
+  quotas      Json        // maxCourses, maxActiveLearners, maxManagers, storageGb, liveSessionsPerMonth...
+  features    Json        // feature flags: aiTranslation, customCertificates, customDomain...
+  commissionRatePercent   Decimal? @map("commission_rate_percent") @db.Decimal(5, 2)
+  createdAt   DateTime    @default(now()) @map("created_at")
+  updatedAt   DateTime    @updatedAt @map("updated_at")
+
+  prices          PlanPrice[]
+  commissionRules CommissionRule[]
+  @@map("plans")
+}
+
+model PlanPrice {
+  id            String        @id @default(uuid())
+  planId        String        @map("plan_id")
+  plan          Plan          @relation(fields: [planId], references: [id], onDelete: Cascade)
+  period        BillingPeriod
+  currency      String        @default("XOF")
+  amount        Int           // plus petite unité de la devise (BE-07); XOF = unité entière
+  trialDays     Int           @default(0) @map("trial_days")
+  version       Int           @default(1) // une modification de prix crée une nouvelle version (ADM-17)
+  isActive      Boolean       @default(true) @map("is_active")
+  createdAt     DateTime      @default(now()) @map("created_at")
+
+  subscriptions Subscription[]
+
+  @@unique([planId, period, version])
+  @@map("plan_prices")
+}
+
+enum SubscriptionStatus {
+  PENDING_PAYMENT
+  TRIALING
+  ACTIVE
+  GRACE_PERIOD
+  EXPIRED
+  CANCELED
+  SUSPENDED
+}
+
+model Subscription {
+  id              String             @id @default(uuid())
+  tenantId        String             @map("tenant_id")
+  tenant          Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  planPriceId     String             @map("plan_price_id")
+  planPrice       PlanPrice          @relation(fields: [planPriceId], references: [id])
+  status          SubscriptionStatus @default(PENDING_PAYMENT)
+  autoRenew       Boolean            @default(true) @map("auto_renew")
+  startedAt       DateTime?          @map("started_at")
+  currentPeriodEnd DateTime?         @map("current_period_end")
+  graceEndsAt     DateTime?          @map("grace_ends_at")
+  canceledAt      DateTime?          @map("canceled_at")
+  /// Étape 31 : descente de gamme planifiée, appliquée au renouvellement qui suit `pendingChangeAt` (échéance courante).
+  pendingPlanPriceId String?         @map("pending_plan_price_id")
+  pendingChangeAt DateTime?          @map("pending_change_at")
+  /// Étape 31 : échéance (currentPeriodEnd) pour laquelle une demande de renouvellement a déjà été créée (idempotence).
+  renewalForPeriodEnd DateTime?      @map("renewal_for_period_end")
+  /// Étape 31 : état du dernier renouvellement : PENDING | SUCCEEDED | FAILED.
+  lastRenewalStatus String?          @map("last_renewal_status")
+  lastRenewalAt   DateTime?          @map("last_renewal_at")
+  lastRenewalPaymentId String?       @map("last_renewal_payment_id")
+  lastRenewalCheckoutUrl String?     @map("last_renewal_checkout_url")
+  lastRenewalAmount Int?             @map("last_renewal_amount")
+  /// Étape 36 (ADM-09) : remise Admin sur les prochaines facturations (pourcentage OU montant fixe, jamais les deux).
+  discountPercent Int?               @map("discount_percent")
+  discountAmount  Int?               @map("discount_amount")
+  /// Nombre de périodes facturées (renouvellements) restant à remiser ; décrémenté à chaque renouvellement réussi.
+  discountPeriodsRemaining Int?      @map("discount_periods_remaining")
+  /// Étape 36 (ADM-09) : plan offert par l'Admin (sans paiement) ; le motif figure dans le journal d'audit.
+  isComplimentary Boolean            @default(false) @map("is_complimentary")
+  createdAt       DateTime           @default(now()) @map("created_at")
+  updatedAt       DateTime           @updatedAt @map("updated_at")
+
+  payments Payment[]
+
+  @@index([tenantId, status])
+  @@map("subscriptions")
+}
+
+model CreditWallet {
+  id        String   @id @default(uuid())
+  tenantId  String   @unique @map("tenant_id")
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  balance   Int      @default(0) // crédits IA disponibles
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  ledger CreditLedgerEntry[]
+
+  @@map("credit_wallets")
+}
+
+enum CreditLedgerType {
+  PURCHASE
+  DEBIT
+  REFUND
+  EXPIRATION
+  PLAN_GRANT
+}
+
+model CreditLedgerEntry {
+  id             String           @id @default(uuid())
+  walletId       String           @map("wallet_id")
+  wallet         CreditWallet     @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  type           CreditLedgerType
+  amount         Int              // positif = crédit, négatif = débit
+  translationJobId String?        @map("translation_job_id")
+  translationJob TranslationJob?  @relation(fields: [translationJobId], references: [id])
+  creditPackId   String?          @map("credit_pack_id")
+  creditPack     CreditPack?      @relation(fields: [creditPackId], references: [id])
+  note           String?
+  createdAt      DateTime         @default(now()) @map("created_at")
+
+  @@map("credit_ledger_entries")
+}
+
+/** ADM-18: packs de crédits IA (ex. 10 000 / 50 000 / 200 000 crédits) et leur prix. */
+model CreditPack {
+  id         String   @id @default(uuid())
+  name       String
+  creditsAmount Int   @map("credits_amount")
+  price      Int      // plus petite unité de la devise (BE-07)
+  currency   String   @default("XOF")
+  isArchived Boolean  @default(false) @map("is_archived")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  ledgerEntries CreditLedgerEntry[]
+  payments      Payment[]
+
+  @@map("credit_packs")
+}
+
+// ============================================================
+// Paiements & finance (payments, ledger, payouts, refunds)
+// ============================================================
+
+enum PaymentProviderCode {
+  PAYSTACK
+  PIXEL_INNOV
+  OTHER
+}
+
+model PaymentProvider {
+  id            String              @id @default(uuid())
+  code          PaymentProviderCode
+  label         String
+  isActive      Boolean             @default(false) @map("is_active")
+  isTestMode    Boolean             @default(true) @map("is_test_mode")
+  priority      Int                 @default(0)
+  supportedMethods Json             @map("supported_methods") // ["card", "orange_money", "mtn_momo", ...]
+  encryptedCredentials Json         @map("encrypted_credentials")
+  createdAt     DateTime            @default(now()) @map("created_at")
+  updatedAt     DateTime            @updatedAt @map("updated_at")
+
+  payments Payment[]
+
+  @@unique([code])
+  @@map("payment_providers")
+}
+
+enum PaymentType {
+  SUBSCRIPTION
+  CREDIT_PURCHASE
+  COURSE_ENROLLMENT
+}
+
+enum PaymentMethod {
+  CARD
+  ORANGE_MONEY
+  MTN_MOMO
+  MOOV_MONEY
+  WAVE
+  OTHER
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+model Payment {
+  id             String           @id @default(uuid())
+  tenantId       String           @map("tenant_id")
+  tenant         Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  providerId     String           @map("provider_id")
+  provider       PaymentProvider  @relation(fields: [providerId], references: [id])
+  type           PaymentType
+  method         PaymentMethod
+  amount         Int              // plus petite unité (BE-07)
+  currency       String           @default("XOF")
+  providerFee    Int              @default(0) @map("provider_fee")
+  commissionAmount Int            @default(0) @map("commission_amount")
+  providerReference String        @map("provider_reference")
+  status         PaymentStatus    @default(PENDING)
+  rawPayload     Json?            @map("raw_payload") // stockage brut des événements reçus (BE-05)
+  /// Étape 30 : motif d'un échec décidé par la plateforme (ex. « expiré » après 30 minutes sans confirmation).
+  failureReason  String?          @map("failure_reason")
+  subscriptionId String?          @map("subscription_id")
+  subscription   Subscription?    @relation(fields: [subscriptionId], references: [id])
+  enrollmentId   String?          @unique @map("enrollment_id")
+  enrollment     Enrollment?      @relation(fields: [enrollmentId], references: [id])
+  creditPackId   String?          @map("credit_pack_id")
+  creditPack     CreditPack?      @relation(fields: [creditPackId], references: [id])
+  createdAt      DateTime         @default(now()) @map("created_at")
+  updatedAt      DateTime         @updatedAt @map("updated_at")
+
+  refunds Refund[]
+
+  @@unique([providerId, providerReference])
+  @@index([tenantId, status])
+  @@map("payments")
+}
+
+enum CommissionScope {
+  GLOBAL
+  PLAN
+  TENANT
+  COURSE
+}
+
+enum CommissionType {
+  ONLINE
+  OFFLINE
+}
+
+model CommissionRule {
+  id              String          @id @default(uuid())
+  scope           CommissionScope
+  type            CommissionType
+  tenantId        String?         @map("tenant_id")
+  tenant          Tenant?         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  planId          String?         @map("plan_id")
+  plan            Plan?           @relation(fields: [planId], references: [id], onDelete: Cascade)
+  courseId        String?         @map("course_id")
+  course          Course?         @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  percentRate     Decimal?        @map("percent_rate") @db.Decimal(5, 2)
+  fixedAmount     Int?            @map("fixed_amount")
+  validFrom       DateTime        @default(now()) @map("valid_from")
+  validUntil      DateTime?       @map("valid_until")
+  createdAt       DateTime        @default(now()) @map("created_at")
+
+  @@index([tenantId, type])
+  @@index([planId, type])
+  @@map("commission_rules")
+}
+
+enum LedgerAccount {
+  PLATFORM
+  TENANT
+  PROVIDER
+  /** Trésorerie externe (compte bancaire / mobile money de l'entreprise), contrepartie d'un reversement exécuté. */
+  EXTERNAL
+}
+
+enum LedgerDirection {
+  DEBIT
+  CREDIT
+}
+
+enum LedgerSourceType {
+  SALE
+  COMMISSION
+  FEE
+  REFUND
+  PAYOUT
+  OFFLINE_COMMISSION
+}
+
+// Grand livre financier immuable — chaque mouvement produit des écritures en partie double (BE-06).
+model LedgerEntry {
+  id             String           @id @default(uuid())
+  tenantId       String           @map("tenant_id")
+  tenant         Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  account        LedgerAccount
+  direction      LedgerDirection
+  amount         Int
+  currency       String           @default("XOF")
+  sourceType     LedgerSourceType @map("source_type")
+  sourceId       String           @map("source_id") // id du paiement, remboursement, reversement...
+  availableAt    DateTime         @map("available_at") // fin de la période de rétention
+  createdAt      DateTime         @default(now()) @map("created_at")
+
+  @@index([tenantId, account, availableAt])
+  @@map("ledger_entries")
+}
+
+enum PayoutStatus {
+  REQUESTED
+  VALIDATED
+  APPROVED
+  EXECUTED
+  REJECTED
+}
+
+model Payout {
+  id             String       @id @default(uuid())
+  tenantId       String       @map("tenant_id")
+  tenant         Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  amount         Int
+  currency       String       @default("XOF")
+  status         PayoutStatus @default(REQUESTED)
+  destination    Json         // coordonnées de reversement au moment de l'exécution
+  validatedByUserId String?   @map("validated_by_user_id")
+  approvedByUserId  String?   @map("approved_by_user_id")
+  proofUrl       String?      @map("proof_url")
+  rejectionReason String?     @map("rejection_reason")
+  statementUrl   String?      @map("statement_url")
+  requestedAt    DateTime     @default(now()) @map("requested_at")
+  executedAt     DateTime?    @map("executed_at")
+
+  @@index([tenantId, status])
+  @@map("payouts")
+}
+
+enum RefundStatus {
+  REQUESTED
+  ACCEPTED
+  REFUNDED
+  REJECTED
+}
+
+model Refund {
+  id          String       @id @default(uuid())
+  tenantId    String       @map("tenant_id")
+  tenant      Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  paymentId   String       @map("payment_id")
+  payment     Payment      @relation(fields: [paymentId], references: [id])
+  amount      Int
+  reason      String?
+  /// ENT-70 : motif de refus ou commentaire de l'entreprise.
+  decisionNote String?     @map("decision_note")
+  status      RefundStatus @default(REQUESTED)
+  requestedAt DateTime     @default(now()) @map("requested_at")
+  resolvedAt  DateTime?    @map("resolved_at")
+  /// Étape 30 : critères de la politique (section 9.5) évalués À LA DEMANDE : { eligible, withinWindow,
+  /// progressBelowLimit, noAssessmentSubmitted, noCertificate, progressPercent }. Figés : la progression évolue ensuite.
+  eligibility Json?
+  /// Étape 30 : vrai si la demande a été acceptée automatiquement (conditions de la politique remplies).
+  autoAccepted Boolean     @default(false) @map("auto_accepted")
+
+  @@map("refunds")
+}
+
+// ============================================================
+// Catalogue & contenu (courses, course-content, media)
+// ============================================================
+
+enum CourseType {
+  CERTIFYING
+  NON_CERTIFYING
+}
+
+enum CourseStatus {
+  DRAFT
+  PUBLISHED
+  HIDDEN
+  ARCHIVED
+}
+
+enum ProgressionMode {
+  SEQUENTIAL
+  FREE
+}
+
+model Course {
+  id              String          @id @default(uuid())
+  tenantId        String          @map("tenant_id")
+  tenant          Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  title           String
+  subtitle        String?
+  description     String?         @db.Text
+  type            CourseType      @default(CERTIFYING)
+  status          CourseStatus    @default(DRAFT)
+  progressionMode ProgressionMode @default(SEQUENTIAL) @map("progression_mode")
+  sourceLocale    String          @default("fr") @map("source_locale")
+  price           Int             @default(0) // 0 = gratuit
+  compareAtPrice  Int?            @map("compare_at_price")
+  currency        String          @default("XOF")
+  accessDurationDays Int?         @map("access_duration_days") // null = illimité
+  category        String?
+  level           String?
+  estimatedDurationMinutes Int?   @map("estimated_duration_minutes")
+  coverImageUrl   String?         @map("cover_image_url")
+  createdAt       DateTime        @default(now()) @map("created_at")
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  publishedAt     DateTime?       @map("published_at")
+  archivedAt      DateTime?       @map("archived_at")
+
+  locales          CourseLocale[]
+  modules          Module[]
+  enrollments      Enrollment[]
+  liveSessions     LiveSession[]
+  exam             Exam?
+  certificateTemplate CertificateTemplate? @relation(fields: [certificateTemplateId], references: [id])
+  certificateTemplateId String?    @map("certificate_template_id")
+  translationJobs  TranslationJob[]
+  commissionRules  CommissionRule[]
+  instructors      CourseInstructor[]
+
+  @@index([tenantId, status])
+  @@map("courses")
+}
+
+/** ENT-15: formateur(s) attribués à une formation (section 2, rôle "Formateur / Concepteur"). */
+model CourseInstructor {
+  courseId String @map("course_id")
+  course   Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  userId   String @map("user_id")
+
+  @@id([courseId, userId])
+  @@map("course_instructors")
+}
+
+enum LocaleOrigin {
+  SOURCE
+  AI
+  MANUAL
+}
+
+enum LocaleStatus {
+  DRAFT
+  PUBLISHED
+}
+
+model CourseLocale {
+  id        String       @id @default(uuid())
+  courseId  String       @map("course_id")
+  course    Course       @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  locale    String
+  status    LocaleStatus @default(DRAFT)
+  origin    LocaleOrigin @default(MANUAL)
+  title     String?
+  subtitle  String?
+  description String?    @db.Text
+  createdAt DateTime     @default(now()) @map("created_at")
+  updatedAt DateTime     @updatedAt @map("updated_at")
+
+  @@unique([courseId, locale])
+  @@map("course_locales")
+}
+
+/** ENT-46/BE: contenu pédagogique d'une leçon traduit dans une langue cible. */
+model LessonLocale {
+  id          String       @id @default(uuid())
+  lessonId    String       @map("lesson_id")
+  lesson      Lesson       @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  locale      String
+  status      LocaleStatus @default(DRAFT)
+  origin      LocaleOrigin @default(MANUAL)
+  title       String?
+  contentHtml String?      @map("content_html") @db.Text
+  createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @updatedAt @map("updated_at")
+
+  @@unique([lessonId, locale])
+  @@map("lesson_locales")
+}
+
+model Module {
+  id          String   @id @default(uuid())
+  courseId    String   @map("course_id")
+  course      Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  title       String
+  description String?
+  order       Int
+  estimatedDurationMinutes Int? @map("estimated_duration_minutes")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  lessons Lesson[]
+  quiz    Quiz?
+
+  @@index([courseId, order])
+  @@map("modules")
+}
+
+enum ResourceType {
+  TEXT
+  PDF
+  AUDIO
+  VIDEO
+  IMAGE
+  DOCUMENT
+  LINK
+}
+
+model Lesson {
+  id             String       @id @default(uuid())
+  moduleId       String       @map("module_id")
+  module         Module       @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  title          String
+  order          Int
+  contentHtml    String?      @map("content_html") @db.Text // nettoyé (BE-09)
+  resourceType   ResourceType @default(TEXT)
+  storageUrl     String?      @map("storage_url")
+  isMandatory    Boolean      @default(true) @map("is_mandatory")
+  completionCriteria Json?    @map("completion_criteria") // ex: { videoWatchedPercent: 90 }
+  downloadAllowed Boolean     @default(false) @map("download_allowed")
+  createdAt      DateTime     @default(now()) @map("created_at")
+  updatedAt      DateTime     @updatedAt @map("updated_at")
+
+  progress Progress[]
+  locales  LessonLocale[]
+
+  @@index([moduleId, order])
+  @@map("lessons")
+}
+
+enum MediaAssetStatus {
+  UPLOADING
+  /// Étape 28 : téléversé, en attente (ou nouvelle tentative) d'analyse antivirus ; jamais servi.
+  SCAN_PENDING
+  PROCESSING
+  READY
+  FAILED
+  /// Étape 28 : refusé par l'analyse antivirus (fichier supprimé du stockage).
+  REJECTED
+}
+
+enum MediaAssetKind {
+  VIDEO
+  AUDIO
+  IMAGE
+  DOCUMENT
+}
+
+/**
+ * Module Media (section 4.1): téléversement direct vers S3 par URL
+ * présignée, transcodage vidéo HLS (section 15.4), URL signées à durée
+ * limitée (section 11). Une Lesson référence un MediaAsset via storageUrl
+ * une fois celui-ci au statut READY.
+ */
+model MediaAsset {
+  id               String           @id @default(uuid())
+  tenantId         String           @map("tenant_id")
+  tenant           Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  kind             MediaAssetKind
+  status           MediaAssetStatus @default(UPLOADING)
+  originalFilename String           @map("original_filename")
+  mimeType         String           @map("mime_type")
+  sizeBytes        Int              @map("size_bytes")
+  storageKey       String           @unique @map("storage_key") // clé S3 de l'original
+  /** Préfixe S3 du manifeste HLS multi-débits une fois le transcodage terminé (vidéo uniquement). */
+  hlsPrefix        String?          @map("hls_prefix")
+  durationSeconds  Int?             @map("duration_seconds")
+  downloadAllowed  Boolean          @default(false) @map("download_allowed")
+  failureReason    String?          @map("failure_reason")
+  createdAt        DateTime         @default(now()) @map("created_at")
+  readyAt          DateTime?        @map("ready_at")
+
+  @@index([tenantId, status])
+  @@map("media_assets")
+}
+
+// ============================================================
+// Évaluation (assessments) : quiz de module, examen final
+// ============================================================
+
+enum QuestionType {
+  SINGLE_CHOICE
+  MULTIPLE_CHOICE
+  TRUE_FALSE
+}
+
+model Quiz {
+  id              String   @id @default(uuid())
+  moduleId        String   @unique @map("module_id")
+  module          Module   @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  passingScorePercent Int  @default(60) @map("passing_score_percent")
+  maxAttempts     Int?     @map("max_attempts")
+  delayBetweenAttemptsMinutes Int? @map("delay_between_attempts_minutes")
+  timeLimitMinutes Int?    @map("time_limit_minutes")
+  questionsToDraw Int?     @map("questions_to_draw")
+  shuffleQuestions Boolean @default(true) @map("shuffle_questions")
+  shuffleAnswers  Boolean  @default(true) @map("shuffle_answers")
+  resultsDisplay  String   @default("SCORE_ONLY") @map("results_display") // SCORE_ONLY | SCORE_AND_ANSWERS | DETAILED
+  requireLiveAttendance Boolean @default(false) @map("require_live_attendance")
+  /// ENT-34 : poids du quiz du module dans la note finale de la formation (défaut 1).
+  weight          Int      @default(1)
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  questions Question[]
+  attempts  Attempt[]
+
+  @@map("quizzes")
+}
+
+model Exam {
+  id              String   @id @default(uuid())
+  courseId        String   @unique @map("course_id")
+  course          Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  passingScorePercent Int  @default(60) @map("passing_score_percent")
+  maxAttempts     Int?     @map("max_attempts")
+  delayBetweenAttemptsMinutes Int? @map("delay_between_attempts_minutes")
+  timeLimitMinutes Int     @default(60) @map("time_limit_minutes")
+  questionsPerModule Int?  @map("questions_per_module")
+  allowReentry    Boolean  @default(false) @map("allow_reentry")
+  /// ENT-34 : poids de l'examen final dans la note finale de la formation (défaut 1).
+  weight          Int      @default(1)
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  questions Question[]
+  attempts  Attempt[]
+
+  @@map("exams")
+}
+
+model Question {
+  id            String       @id @default(uuid())
+  quizId        String?      @map("quiz_id")
+  quiz          Quiz?        @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  examId        String?      @map("exam_id")
+  exam          Exam?        @relation(fields: [examId], references: [id], onDelete: Cascade)
+  type          QuestionType
+  statementHtml String       @map("statement_html") @db.Text
+  explanation   String?      @db.Text
+  points        Int          @default(1)
+  order         Int          @default(0)
+  moduleWeight  String?      @map("module_weight") // référence au module pour la pondération d'examen
+
+  options Option[]
+
+  @@index([quizId])
+  @@index([examId])
+  @@map("questions")
+}
+
+model Option {
+  id         String   @id @default(uuid())
+  questionId String   @map("question_id")
+  question   Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  label      String
+  isCorrect  Boolean  @default(false) @map("is_correct")
+  order      Int      @default(0)
+
+  @@map("options")
+}
+
+// ============================================================
+// Apprentissage (enrollments, progress)
+// ============================================================
+
+enum EnrollmentStatus {
+  PENDING_PAYMENT
+  PENDING_VALIDATION
+  ACTIVE
+  COMPLETED
+  EXPIRED
+  SUSPENDED
+  REFUSED
+}
+
+model Enrollment {
+  id            String           @id @default(uuid())
+  userId        String           @map("user_id")
+  user          User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  courseId      String           @map("course_id")
+  course        Course           @relation(fields: [courseId], references: [id])
+  status        EnrollmentStatus @default(PENDING_PAYMENT)
+  pricePaid     Int              @map("price_paid") // prix figé à l'inscription (RG-05)
+  currency      String           @default("XOF")
+  paymentMethod PaymentMethod?   @map("payment_method")
+  offlinePaymentReference String? @map("offline_payment_reference")
+  offlinePaymentAmount    Int?    @map("offline_payment_amount")
+  /// ENT-61: motif du refus d'un paiement hors plateforme.
+  refusalReason           String? @map("refusal_reason")
+  /// ENT-62: inscription manuelle sans paiement (motif libre) et gestionnaire qui l'a créée.
+  manualEnrollmentNote    String? @map("manual_enrollment_note")
+  enrolledByUserId        String? @map("enrolled_by_user_id")
+  locale        String           @default("fr")
+  startedAt     DateTime?        @map("started_at")
+  expiresAt     DateTime?        @map("expires_at")
+  completedAt   DateTime?        @map("completed_at")
+  /** PUB-18: dernier rappel d'inactivité envoyé (au plus un par 14 jours). */
+  lastInactivityReminderAt DateTime? @map("last_inactivity_reminder_at")
+  createdAt     DateTime         @default(now()) @map("created_at")
+  updatedAt     DateTime         @updatedAt @map("updated_at")
+
+  payment     Payment?
+  progress    Progress[]
+  attempts    Attempt[]
+  attemptGrants AttemptGrant[]
+  certificate Certificate?
+  /// ENT-44: attestation de suivi (formation non certifiante).
+  attestation Attestation?
+
+  @@unique([userId, courseId])
+  @@index([courseId, status])
+  @@map("enrollments")
+}
+
+enum ProgressState {
+  NOT_STARTED
+  IN_PROGRESS
+  COMPLETED
+}
+
+model Progress {
+  id           String        @id @default(uuid())
+  enrollmentId String        @map("enrollment_id")
+  enrollment   Enrollment    @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+  lessonId     String        @map("lesson_id")
+  lesson       Lesson        @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  state        ProgressState @default(NOT_STARTED)
+  watchedPercent Int?        @map("watched_percent")
+  /** ENT-25/RG-08(a): simple consultation enregistrée (PDF ouvert, page visitée). */
+  opened       Boolean       @default(false)
+  startedAt    DateTime?     @map("started_at")
+  completedAt  DateTime?     @map("completed_at")
+  /** PUB-18: dernière activité sur la leçon (base du rappel d'inactivité). */
+  updatedAt    DateTime      @default(now()) @updatedAt @map("updated_at")
+
+  @@unique([enrollmentId, lessonId])
+  @@map("progress")
+}
+
+enum AttemptStatus {
+  IN_PROGRESS
+  SUBMITTED
+  PASSED
+  FAILED
+  EXPIRED
+}
+
+model Attempt {
+  id           String        @id @default(uuid())
+  enrollmentId String        @map("enrollment_id")
+  enrollment   Enrollment    @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+  quizId       String?       @map("quiz_id")
+  quiz         Quiz?         @relation(fields: [quizId], references: [id])
+  examId       String?       @map("exam_id")
+  exam         Exam?         @relation(fields: [examId], references: [id])
+  /** ENT-28: identifiants des questions effectivement tirées pour cette tentative, figés au démarrage. */
+  questionIds  Json          @default("[]") @map("question_ids")
+  status       AttemptStatus @default(IN_PROGRESS)
+  answers      Json?         // réponses soumises
+  scorePercent Int?          @map("score_percent")
+  startedAt    DateTime      @default(now()) @map("started_at")
+  submittedAt  DateTime?     @map("submitted_at")
+
+  @@index([enrollmentId])
+  @@map("attempts")
+}
+
+/**
+ * ENT-31/RG-10: tentatives bonus accordées par un gestionnaire à une
+ * inscription précise après épuisement — n'affecte jamais le plafond global
+ * du quiz/examen ni les autres apprenants.
+ */
+model AttemptGrant {
+  id           String   @id @default(uuid())
+  enrollmentId String   @map("enrollment_id")
+  enrollment   Enrollment @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+  quizId       String?  @map("quiz_id")
+  examId       String?  @map("exam_id")
+  extraAttempts Int     @map("extra_attempts")
+  grantedByUserId String @map("granted_by_user_id")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([enrollmentId, quizId])
+  @@index([enrollmentId, examId])
+  @@map("attempt_grants")
+}
+
+// ============================================================
+// Certification (certificates)
+// ============================================================
+
+enum CertificateStatus {
+  VALID
+  REVOKED
+  REISSUED
+}
+
+model CertificateTemplate {
+  id        String   @id @default(uuid())
+  tenantId  String   @map("tenant_id")
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name      String
+  design    Json     // mise en page, logo, insigne, signatures, couleurs
+  isDefault Boolean  @default(false) @map("is_default")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  courses      Course[]
+  certificates Certificate[]
+
+  @@map("certificate_templates")
+}
+
+model Certificate {
+  id           String             @id @default(uuid())
+  enrollmentId String             @unique @map("enrollment_id")
+  enrollment   Enrollment         @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+  templateId   String             @map("template_id")
+  template     CertificateTemplate @relation(fields: [templateId], references: [id])
+  number       String             @unique // numéro unique non réutilisable (RG-13)
+  status       CertificateStatus  @default(VALID)
+  learnerNameSnapshot String      @map("learner_name_snapshot") // nom figé à la délivrance (RG-14)
+  courseTitleSnapshot String      @map("course_title_snapshot")
+  scorePercent Int?               @map("score_percent")
+  pdfUrl       String             @map("pdf_url")
+  qrVerificationUrl String        @map("qr_verification_url")
+  revocationReason String?        @map("revocation_reason")
+  issuedAt     DateTime           @default(now()) @map("issued_at")
+  revokedAt    DateTime?          @map("revoked_at")
+
+  @@map("certificates")
+}
+
+enum AttestationStatus {
+  VALID
+  REVOKED
+}
+
+/// ENT-44: attestation de suivi d'une formation NON certifiante (une seule par inscription, numéro ATT-AAAAMM-XXXXXXXX).
+model Attestation {
+  id           String            @id @default(uuid())
+  enrollmentId String            @unique @map("enrollment_id")
+  enrollment   Enrollment        @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+  number       String            @unique // numéro unique non réutilisable
+  status       AttestationStatus @default(VALID)
+  learnerNameSnapshot String     @map("learner_name_snapshot") // nom figé à la délivrance
+  courseTitleSnapshot String     @map("course_title_snapshot")
+  progressPercent Int            @map("progress_percent")
+  durationMinutes Int?           @map("duration_minutes")
+  startedAt    DateTime?         @map("started_at")
+  endedAt      DateTime?         @map("ended_at")
+  pdfUrl       String            @map("pdf_url")
+  qrVerificationUrl String       @map("qr_verification_url")
+  revocationReason String?       @map("revocation_reason")
+  issuedAt     DateTime          @default(now()) @map("issued_at")
+  revokedAt    DateTime?         @map("revoked_at")
+
+  @@map("attendance_certificates")
+}
+
+// ============================================================
+// Localisation (translation)
+// ============================================================
+
+enum TranslationJobStatus {
+  ESTIMATED
+  CONFIRMED
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+}
+
+model TranslationJob {
+  id              String               @id @default(uuid())
+  tenantId        String               @map("tenant_id")
+  tenant          Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  courseId        String               @map("course_id")
+  course          Course               @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  targetLocale    String               @map("target_locale")
+  wordCount       Int?                 @map("word_count")
+  estimatedCredits Int?                @map("estimated_credits")
+  debitedCredits  Int?                 @map("debited_credits")
+  status          TranslationJobStatus @default(ESTIMATED)
+  errorMessage    String?              @map("error_message")
+  createdAt       DateTime             @default(now()) @map("created_at")
+  completedAt     DateTime?            @map("completed_at")
+
+  creditLedgerEntries CreditLedgerEntry[]
+
+  @@map("translation_jobs")
+}
+
+// ============================================================
+// Sessions live (Google Meet)
+// ============================================================
+
+enum LiveSessionStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELED
+}
+
+model LiveSession {
+  id             String            @id @default(uuid())
+  tenantId       String            @map("tenant_id")
+  tenant         Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  courseId       String            @map("course_id")
+  course         Course            @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  moduleId       String?           @map("module_id")
+  title          String
+  startAt        DateTime          @map("start_at")
+  durationMinutes Int              @map("duration_minutes")
+  timezone       String            @default("Africa/Abidjan")
+  status         LiveSessionStatus @default(SCHEDULED)
+  meetLink       String?           @map("meet_link")
+  googleEventId  String?           @map("google_event_id")
+  capacity       Int?
+  replayUrl      String?           @map("replay_url")
+  createdAt      DateTime          @default(now()) @map("created_at")
+
+  attendances Attendance[]
+
+  @@index([tenantId, startAt])
+  @@map("live_sessions")
+}
+
+model Attendance {
+  id            String      @id @default(uuid())
+  liveSessionId String      @map("live_session_id")
+  liveSession   LiveSession @relation(fields: [liveSessionId], references: [id], onDelete: Cascade)
+  userId        String      @map("user_id")
+  joinedAt      DateTime?   @map("joined_at")
+  leftAt        DateTime?   @map("left_at")
+  attended      Boolean     @default(false)
+  /// ENT-57 : pointage manuel par l'entreprise (présent/absent), prioritaire sur le suivi automatique.
+  markedManually Boolean    @default(false) @map("marked_manually")
+  markedById    String?     @map("marked_by_id")
+  markedAt      DateTime?   @map("marked_at")
+
+  @@unique([liveSessionId, userId])
+  @@map("attendances")
+}
+
+// ============================================================
+// Notifications
+// ============================================================
+
+enum NotificationChannel {
+  EMAIL
+  SMS
+  IN_APP
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+model Notification {
+  id          String              @id @default(uuid())
+  tenantId    String?             @map("tenant_id") // null pour les destinataires plateforme (Admin)
+  recipientUserId String          @map("recipient_user_id")
+  channel     NotificationChannel
+  templateKey String              @map("template_key") // ex: "user.invited", "payment.failed"
+  locale      String
+  payload     Json                // variables injectées dans le template (nom, lien, montant...)
+  status      NotificationStatus  @default(PENDING)
+  errorMessage String?            @map("error_message")
+  createdAt   DateTime            @default(now()) @map("created_at")
+  sentAt      DateTime?           @map("sent_at")
+  readAt      DateTime?           @map("read_at") // pertinent uniquement pour IN_APP
+
+  @@index([recipientUserId, status])
+  @@index([recipientUserId, readAt])
+  @@map("notifications")
+}
+
+// ============================================================
+// Pilotage (audit, analytics)
+// ============================================================
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  tenantId  String?  @map("tenant_id") // null pour les actions au niveau plateforme
+  tenant    Tenant?  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  actorId   String?  @map("actor_id")
+  actor     User?    @relation(fields: [actorId], references: [id])
+  action    String   // ex: "payout.approved", "enrollment.offline_validated"
+  objectType String  @map("object_type")
+  objectId  String   @map("object_id")
+  before    Json?
+  after     Json?
+  ipAddress String?  @map("ip_address")
+  userAgent String?  @map("user_agent")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([tenantId, objectType, objectId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ============================================================
+// Pages légales de la plateforme (ADM-41)
+// ============================================================
+
+enum LegalDocumentType {
+  TERMS_OF_USE
+  TERMS_OF_SALE
+  PRIVACY_POLICY
+}
+
+/// ADM-41 : CGU / CGV / politique de confidentialité, versionnées. Une version publiée est immuable ;
+/// la version courante d'un type est sa plus récente version publiée.
+model LegalDocument {
+  id          String            @id @default(uuid())
+  type        LegalDocumentType
+  version     Int
+  title       String
+  /// Texte brut (paragraphes séparés par une ligne vide) : jamais interprété comme HTML à l'affichage.
+  content     String            @db.Text
+  /// null = brouillon.
+  publishedAt DateTime?         @map("published_at")
+  createdAt   DateTime          @default(now()) @map("created_at")
+
+  acceptances LegalAcceptance[]
+
+  @@unique([type, version])
+  @@map("legal_documents")
+}
+
+/// ADM-41 : acceptation tracée d'une version précise par un utilisateur.
+model LegalAcceptance {
+  id         String        @id @default(uuid())
+  userId     String        @map("user_id")
+  documentId String        @map("document_id")
+  document   LegalDocument @relation(fields: [documentId], references: [id])
+  acceptedAt DateTime      @default(now()) @map("accepted_at")
+
+  @@unique([userId, documentId])
+  @@index([documentId])
+  @@map("legal_acceptances")
+}
+
+// ============================================================
+// Modèles d'e-mails modifiables (ADM-38)
+// ============================================================
+
+/// ADM-38 : surcharge, par l'Admin, du sujet et du contenu d'un gabarit de notification pour une langue.
+/// Absence de ligne = texte d'origine du code. Syntaxe `{{variable}}`, validée à l'enregistrement.
+model NotificationTemplateOverride {
+  id          String   @id @default(uuid())
+  templateKey String   @map("template_key")
+  locale      String
+  subject     String
+  body        String   @db.Text
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@unique([templateKey, locale])
+  @@map("notification_template_overrides")
+}
+
+// ============================================================
+// Langues de la plateforme (ADM-40)
+// ============================================================
+
+/// ADM-40 : activation par langue (interface et traduction IA). Absence de ligne = langue activée ;
+/// le français est toujours actif quelle que soit la valeur stockée.
+model LanguageSetting {
+  code      String   @id
+  enabled   Boolean
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("language_settings")
+}
+
+// ============================================================
+// Santé technique : journal des webhooks de paiement (ADM-35)
+// ============================================================
+
+enum WebhookOutcome {
+  PROCESSED
+  DUPLICATE
+  UNKNOWN_REFERENCE
+  INVALID_SIGNATURE
+  ERROR
+}
+
+/// ADM-35 : issue de chaque webhook reçu d'un fournisseur connu. Aucun contenu stocké (le corps brut peut contenir
+/// des données de paiement) : uniquement fournisseur, issue et date, pour mesurer le taux d'erreur.
+model WebhookEvent {
+  id           String         @id @default(uuid())
+  providerCode String         @map("provider_code")
+  outcome      WebhookOutcome
+  receivedAt   DateTime       @default(now()) @map("received_at")
+  /// Étape 30 : référence du paiement chez le fournisseur (extraite APRÈS validation de la signature), seule donnée
+  /// nécessaire pour rejouer le traitement (le serveur re-vérifie auprès du fournisseur). Jamais le corps brut.
+  providerReference String?     @map("provider_reference")
+  /// Étape 30 : date à laquelle un rejeu a résolu l'échec (le webhook n'apparaît alors plus dans la file à traiter).
+  resolvedAt   DateTime?        @map("resolved_at")
+
+  @@index([receivedAt])
+  @@index([providerCode, receivedAt])
+  @@map("webhook_events")
+}
+
+// ============================================================
+// Bibliothèque de modèles de certificats (ADM-39)
+// ============================================================
+
+/// ADM-39 : modèle proposé par la plateforme à toutes les entreprises (police, couleurs, orientation, bordure).
+/// Une entreprise qui l'utilise en reçoit une COPIE dans ses propres modèles : modifier ou supprimer ensuite le
+/// modèle de la bibliothèque ne change jamais l'apparence des certificats déjà émis.
+model CertificateLibraryTemplate {
+  id          String   @id @default(uuid())
+  name        String   @unique
+  description String?
+  design      Json
+  /// false = brouillon, invisible des entreprises.
+  isPublished Boolean  @default(false) @map("is_published")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("certificate_library_templates")
+}
+
+// ============================================================
+// Intégrations de la plateforme (ADM-37) : secrets chiffrés AES-256-GCM
+// ============================================================
+
+model IntegrationSetting {
+  provider  String   @id
+  /// Champs non secrets (clair).
+  values    Json     @default("{}")
+  /// Champs secrets : clé -> texte chiffré. Jamais renvoyés par l'API.
+  secrets   Json     @default("{}")
+  updatedBy String?  @map("updated_by")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("integration_settings")
+}
+
+
+// ============================================================
+// Paramètres financiers de la plateforme (ADM-21, ADM-23) — étape 30
+// ============================================================
+
+/// Table clé/valeur versionnée par date d'effet : un changement INSÈRE une ligne (jamais de mise à jour), la valeur
+/// en vigueur est la ligne la plus récente dont `effectiveFrom` est passée. Clés : RETENTION_DAYS,
+/// MINIMUM_PAYOUT_THRESHOLD, PAYOUT_FREQUENCY, TRANSACTION_FEE_BEARER. Aucune valeur secrète.
+model PlatformSetting {
+  id              String   @id @default(uuid())
+  key             String
+  value           String
+  effectiveFrom   DateTime @default(now()) @map("effective_from")
+  changedByUserId String?  @map("changed_by_user_id")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@index([key, effectiveFrom])
+  @@map("platform_settings")
+}

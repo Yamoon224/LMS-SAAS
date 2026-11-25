@@ -1,0 +1,64 @@
+# Reverse proxy multi-tenant (section 3.3) : routage par nom d'hôte, certificat joker *.{APP_BASE_DOMAIN}.
+# Variables (injectées par docker-compose) : APP_BASE_DOMAIN, ACME_EMAIL, DNS_PROVIDER, DNS_API_TOKEN, MAX_UPLOAD_SIZE.
+{
+	email {$ACME_EMAIL}
+}
+
+# Un seul certificat joker couvre api., admin., {slug}. et {slug}-backoffice. (un seul niveau de sous-domaine).
+*.{$APP_BASE_DOMAIN} {
+	tls {
+		dns {$DNS_PROVIDER:cloudflare} {$DNS_API_TOKEN}
+	}
+
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# Taille maximale des corps de requête (téléversements de médias via l'API) : MAX_UPLOAD_SIZE.
+	request_body {
+		max_size {$MAX_UPLOAD_SIZE:110MB}
+	}
+
+	@api host api.{$APP_BASE_DOMAIN}
+	@admin host admin.{$APP_BASE_DOMAIN}
+	@backoffice expression {http.request.host}.endsWith("-backoffice.{$APP_BASE_DOMAIN}")
+
+	# Caddy conserve Host et ajoute X-Forwarded-For/Proto/Host ; on les rend explicites (le backend résout le tenant
+	# depuis le sous-domaine).
+	handle @api {
+		reverse_proxy backend:3001 {
+			header_up Host {host}
+			header_up X-Forwarded-Host {host}
+			header_up X-Forwarded-Proto {scheme}
+			health_uri /v1/health
+			health_interval 15s
+		}
+	}
+
+	handle @admin {
+		reverse_proxy admin:3000 {
+			header_up X-Forwarded-Host {host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
+	handle @backoffice {
+		reverse_proxy business:3000 {
+			header_up X-Forwarded-Host {host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
+	# Tous les autres sous-domaines : vitrine apprenant de l'entreprise {slug}.
+	handle {
+		reverse_proxy learning:3000 {
+			header_up X-Forwarded-Host {host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+}

@@ -1,0 +1,188 @@
+# Production — SaaS LMS. Aucun secret en dur : tout vient de .env.prod (voir deploy/.env.prod.example).
+# Démarrage (depuis la racine du dépôt) :
+#   docker compose --env-file deploy/.env.prod -f deploy/docker-compose.yml build
+#   docker compose --env-file deploy/.env.prod -f deploy/docker-compose.yml up -d
+# Profils optionnels : minio (stockage S3 local, sinon AWS S3), antivirus (clamd).
+name: saas-lms-prod
+
+x-app: &app
+  env_file: [.env.prod]
+  restart: unless-stopped
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+
+services:
+  caddy:
+    build:
+      context: ./caddy
+      args:
+        DNS_PLUGIN: ${DNS_PLUGIN:-cloudflare}
+    env_file: [.env.prod]
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - caddy_data:/data # certificats : à conserver (limites de taux Let's Encrypt)
+      - caddy_config:/config
+    networks: [edge]
+    depends_on:
+      backend: { condition: service_healthy }
+      admin: { condition: service_healthy }
+      business: { condition: service_healthy }
+      learning: { condition: service_healthy }
+
+  backend:
+    <<: *app
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.backend
+      target: runtime
+    image: ${IMAGE_PREFIX:-saas-lms}-backend:${IMAGE_TAG:-latest}
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD requis}@postgres:5432/${POSTGRES_DB}?schema=public
+      REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD requis}@redis:6379
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    networks: [edge, data]
+    read_only: true
+    tmpfs: [/tmp]
+
+  # Migrations Prisma, exécutées à chaque démarrage avant le backend (idempotent).
+  migrate:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.backend
+      target: migrate
+    image: ${IMAGE_PREFIX:-saas-lms}-migrate:${IMAGE_TAG:-latest}
+    env_file: [.env.prod]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD requis}@postgres:5432/${POSTGRES_DB}?schema=public
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+    networks: [data]
+
+  admin:
+    <<: *app
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.next
+      args:
+        APP: admin
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL requis}
+        NEXT_PUBLIC_APP_BASE_DOMAIN: ${APP_BASE_DOMAIN:?APP_BASE_DOMAIN requis}
+        NEXT_PUBLIC_SENTRY_DSN: ${NEXT_PUBLIC_SENTRY_DSN:-}
+    image: ${IMAGE_PREFIX:-saas-lms}-admin:${IMAGE_TAG:-latest}
+    networks: [edge]
+    read_only: true
+    tmpfs: [/tmp, /app/admin/.next/cache]
+
+  business:
+    <<: *app
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.next
+      args:
+        APP: business
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL requis}
+        NEXT_PUBLIC_APP_BASE_DOMAIN: ${APP_BASE_DOMAIN:?APP_BASE_DOMAIN requis}
+        NEXT_PUBLIC_SENTRY_DSN: ${NEXT_PUBLIC_SENTRY_DSN:-}
+    image: ${IMAGE_PREFIX:-saas-lms}-business:${IMAGE_TAG:-latest}
+    networks: [edge]
+    read_only: true
+    tmpfs: [/tmp, /app/business/.next/cache]
+
+  learning:
+    <<: *app
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.next
+      args:
+        APP: learning
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL requis}
+        NEXT_PUBLIC_APP_BASE_DOMAIN: ${APP_BASE_DOMAIN:?APP_BASE_DOMAIN requis}
+        NEXT_PUBLIC_SENTRY_DSN: ${NEXT_PUBLIC_SENTRY_DSN:-}
+    image: ${IMAGE_PREFIX:-saas-lms}-learning:${IMAGE_TAG:-latest}
+    networks: [edge]
+    read_only: true
+    tmpfs: [/tmp, /app/learning/.next/cache]
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER requis}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD requis}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB requis}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Mot de passe lu depuis l'environnement ; AOF activé : les files BullMQ survivent à un redémarrage.
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD requis}
+    volumes:
+      - redis_data:/data
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    profiles: [minio]
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:?S3_ACCESS_KEY_ID requis}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:?S3_SECRET_ACCESS_KEY requis}
+    volumes:
+      - minio_data:/data
+    networks: [data]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  clamav:
+    profiles: [antivirus]
+    image: clamav/clamav:stable
+    restart: unless-stopped
+    volumes:
+      - clamav_db:/var/lib/clamav
+    networks: [data]
+    healthcheck:
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+networks:
+  edge: # exposé au reverse proxy
+  data:
+    internal: true # postgres, redis, minio, clamav : aucun accès Internet ni publication de port
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  clamav_db:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,82 @@
+name: E2E (manuel)
+
+# Non bloquant : déclenché à la main uniquement (Actions > E2E > Run workflow).
+# Il démarre la stack complète (PostgreSQL, Redis, backend, 3 fronts) puis lance Playwright
+# avec Google Chrome installé sur le runner (aucun navigateur Playwright téléchargé).
+on:
+  workflow_dispatch:
+    inputs:
+      tenant_slug:
+        description: "Slug de l'entreprise de démo (seed)"
+        default: "demo"
+        required: false
+
+env:
+  NODE_VERSION: "20"
+  PNPM_VERSION: "9"
+
+jobs:
+  e2e:
+    name: Parcours E2E Playwright
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: saas_lms
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+    env:
+      NEXT_PUBLIC_APP_BASE_DOMAIN: localhost
+      TWO_FACTOR_MANDATORY: "false"
+      E2E_ADMIN_URL: http://localhost:3002
+      E2E_BUSINESS_URL: http://${{ inputs.tenant_slug }}-backoffice.localhost:3003
+      E2E_LEARNING_URL: http://${{ inputs.tenant_slug }}.localhost:3004
+      E2E_API_URL: http://localhost:3001/v1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
+      - run: pnpm install --frozen-lockfile
+      # A adapter : variables d'environnement du backend (voir backend/.env.example) puis migrations et seed.
+      - name: Préparer la base
+        run: |
+          cp backend/.env.example backend/.env
+          pnpm db:generate
+          pnpm db:migrate
+          pnpm db:seed
+      - name: Démarrer la stack (arrière-plan)
+        run: |
+          pnpm --filter backend dev > backend.log 2>&1 &
+          pnpm --filter admin dev > admin.log 2>&1 &
+          pnpm --filter business dev > business.log 2>&1 &
+          pnpm --filter learning dev > learning.log 2>&1 &
+          npx --yes wait-on -t 180000 tcp:3001 tcp:3002 tcp:3003 tcp:3004
+      - name: Google Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+      - name: Playwright
+        run: pnpm test:e2e
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: |
+            e2e/playwright-report
+            e2e/test-results
+            *.log
+          retention-days: 7

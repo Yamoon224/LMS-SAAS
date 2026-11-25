@@ -1,0 +1,10 @@
+{
+  "common": {
+    "loading": "جارٍ التحميل…",
+    "error": "حدث خطأ"
+  },
+  "dashboard": {
+    "title": "لوحة التحكم العامة",
+    "tenantsSectionTitle": "الشركات"
+  }
+}

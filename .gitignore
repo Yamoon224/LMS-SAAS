@@ -1,0 +1,59 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+.next/
+out/
+build/
+*.tsbuildinfo
+
+# Turborepo
+.turbo/
+
+# Environment
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Testing
+coverage/
+playwright-report/
+test-results/
+
+# IDE
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Prisma
+backend/prisma/migrations/dev.db
+
+# Docker volumes (local)
+.docker/
+
+# Misc
+*.pem
+.vercel
+storybook-static/
+
+# E2E Playwright
+e2e/.auth/
+
+# Production (secrets)
+deploy/.env.prod
+e2e/a11y-report/
+
+# Fichiers téléversés en local (logos)
+uploads/

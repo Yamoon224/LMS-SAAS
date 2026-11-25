@@ -1,0 +1,10 @@
+{
+  "common": {
+    "loading": "Chargement…",
+    "error": "Une erreur est survenue"
+  },
+  "dashboard": {
+    "title": "Tableau de bord global",
+    "tenantsSectionTitle": "Entreprises"
+  }
+}
